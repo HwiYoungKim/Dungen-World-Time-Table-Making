@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>던전월드 일정 조율 시트</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>📅 던전월드 일정 조율 시트</h1>
+  <p class="subtitle">16명의 가능한 시간을 모아 최적의 모임 시간을 찾아보세요</p>
+</header>
+
+<main>
+  <section class="toolbar">
+    <div class="view-tabs">
+      <button id="tab-edit" class="tab active">✏️ 내 시간 입력</button>
+      <button id="tab-heatmap" class="tab">🔥 전체 히트맵</button>
+    </div>
+    <div class="actions">
+      <button id="btn-export" class="btn">📤 JSON 내보내기</button>
+      <button id="btn-import" class="btn">📥 JSON 가져오기</button>
+      <input type="file" id="file-import" accept=".json,application/json" hidden>
+      <button id="btn-clear" class="btn btn-danger">🗑️ 전체 초기화</button>
+    </div>
+  </section>
+
+  <!-- 입력 뷰 -->
+  <section id="view-edit">
+    <div class="participant-bar">
+      <label for="participant-select">참가자 선택:</label>
+      <select id="participant-select"></select>
+      <button id="btn-rename" class="btn btn-small">이름 변경</button>
+      <button id="btn-clear-one" class="btn btn-small btn-danger">이 참가자 시간 지우기</button>
+    </div>
+    <p class="hint">셀을 클릭하거나 드래그해서 가능한 시간을 체크하세요. 다시 클릭/드래그하면 해제됩니다.</p>
+    <div class="grid-wrap">
+      <table id="edit-grid" class="time-grid"></table>
+    </div>
+  </section>
+
+  <!-- 히트맵 뷰 -->
+  <section id="view-heatmap" hidden>
+    <p class="hint">색이 진할수록 가능한 인원이 많습니다. 셀을 클릭하면 가능한 사람 목록이 표시됩니다.</p>
+    <div class="legend" id="heatmap-legend"></div>
+    <div class="grid-wrap">
+      <table id="heatmap-grid" class="time-grid heatmap"></table>
+    </div>
+    <div id="cell-detail" class="cell-detail" hidden></div>
+    <div class="best-times">
+      <h2>🏆 최적 시간 TOP 5</h2>
+      <ol id="best-times-list"></ol>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>데이터는 이 브라우저의 localStorage에 자동 저장됩니다. 다른 사람과 공유하려면 JSON 내보내기/가져오기를 사용하세요.</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
