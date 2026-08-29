@@ -24,16 +24,17 @@ jobs:
           set -euo pipefail
           API=$(jq -r .api data/sync-registry.json)
           REGISTRY_ID=$(jq -r .registryId data/sync-registry.json)
+          KEY=$(jq -r '.mantleKey // empty' data/sync-registry.json)
           mkdir -p data/backups
 
-          if ! curl -sf "$API/$REGISTRY_ID" -o /tmp/registry.json; then
+          if ! curl -sf -H "X-Mantle-Key: $KEY" "$API/$REGISTRY_ID" -o /tmp/registry.json; then
             echo "::warning::레지스트리를 불러오지 못했습니다. 이번 백업을 건너뜁니다."
             exit 0
           fi
 
           jq -r '.data.codes[]?' /tmp/registry.json | while read -r code; do
             [ -z "$code" ] && continue
-            if curl -sf "$API/$code" -o /tmp/obj.json; then
+            if curl -sf -H "X-Mantle-Key: $KEY" "$API/$code" -o /tmp/obj.json; then
               if jq -e '.data.participants | type == "array"' /tmp/obj.json > /dev/null; then
                 jq '.data' /tmp/obj.json > "data/backups/$code.json"
                 echo "백업 완료: $code"

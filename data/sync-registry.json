@@ -1,5 +1,6 @@
 {
-  "registryId": "ff808181a04ccf2d01a04ef24d570d14",
-  "api": "https://api.restful-api.dev/objects",
-  "description": "공유 코드 레지스트리. GitHub Actions가 이 레지스트리에 등록된 모든 공유 코드의 데이터를 data/backups/ 에 주기적으로 백업합니다."
+  "registryId": "registry",
+  "api": "https://mantledb.sh/v2/moim-dungeon-world-hyk",
+  "mantleKey": "7f4219747d32dd28793aa62ec630d11165e4836d2460f0ed8c61505d87a61d93",
+  "description": "공유 코드 레지스트리. GitHub Actions가 이 레지스트리에 등록된 모든 공유 코드의 데이터를 data/backups/ 에 주기적으로 백업합니다. mantleKey는 네임스페이스 탈취 방지용이며 데이터 자체가 공개용이라 노출되어도 무방합니다."
 }

@@ -2,9 +2,11 @@
 
 // ===== 상수 =====
 const STORAGE_KEY = "moim-scheduler-v2";
-const SYNC_API = "https://api.restful-api.dev/objects";
+const SYNC_API = "https://mantledb.sh/v2/moim-dungeon-world-hyk";
+// 네임스페이스 잠금 키 (데이터 자체가 공개용이라 코드에 포함해도 무방, 외부인의 네임스페이스 탈취 방지용)
+const SYNC_KEY = "7f4219747d32dd28793aa62ec630d11165e4836d2460f0ed8c61505d87a61d93";
 // 공유 코드 목록(레지스트리): GitHub Actions가 이 목록을 보고 저장소에 장기 백업
-const REGISTRY_ID = "ff808181a04ccf2d01a04ef24d570d14";
+const REGISTRY_ID = "registry";
 // 저장소에 커밋된 장기 백업 (서버 데이터 유실 시 복구용)
 const BACKUP_RAW = "https://raw.githubusercontent.com/HwiYoungKim/Dungen-World-Time-Table-Making/main/data/backups";
 const DUNGEON_NAMES = [
@@ -135,36 +137,45 @@ function parseNames(raw) {
 }
 
 // ===== 중앙 서버 동기화 =====
+// 서버가 UTF-8 본문을 깨뜨리는 경우가 있어 한글은 \uXXXX로 이스케이프해서 전송
+function jsonAscii(obj) {
+  return JSON.stringify(obj).replace(/[\u0080-\uffff]/g,
+    c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+}
+
+function friendlyHttpError(status) {
+  if (status === 429 || status === 405)
+    return new Error("서버 요청 한도에 도달했습니다. 변경 사항은 이 기기에 보관되니 잠시 후 💾 저장을 다시 눌러주세요.");
+  return new Error(`서버 응답 오류 (${status})`);
+}
+
 async function apiGet(id) {
-  const r = await fetch(`${SYNC_API}/${encodeURIComponent(id)}`);
+  const r = await fetch(`${SYNC_API}/${encodeURIComponent(id)}`, {
+    headers: { "X-Mantle-Key": SYNC_KEY }
+  });
   if (r.status === 404) {
     const e = new Error("공유 코드를 찾을 수 없습니다.");
     e.notFound = true;
     throw e;
   }
-  if (!r.ok) throw new Error(`서버 응답 오류 (${r.status})`);
+  if (!r.ok) throw friendlyHttpError(r.status);
   const json = await r.json();
   return json.data || null;
 }
 
 async function apiPut(id, data) {
   const r = await fetch(`${SYNC_API}/${encodeURIComponent(id)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: "moim-schedule", data })
+    method: "POST", // MantleDB는 POST가 생성/전체 덮어쓰기
+    headers: { "Content-Type": "application/json", "X-Mantle-Key": SYNC_KEY },
+    body: jsonAscii({ name: "moim-schedule", data })
   });
-  if (!r.ok) throw new Error(`서버 저장 실패 (${r.status})`);
+  if (!r.ok) throw friendlyHttpError(r.status);
 }
 
 async function apiCreate(data) {
-  const r = await fetch(SYNC_API, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: "moim-schedule", data })
-  });
-  if (!r.ok) throw new Error(`서버 생성 실패 (${r.status})`);
-  const json = await r.json();
-  return json.id;
+  const id = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  await apiPut(id, data);
+  return id;
 }
 
 // 병합: 서버/다른 기기 데이터와 로컬 데이터 합치기
@@ -257,9 +268,9 @@ async function pullSchedule(sc) {
   return true;
 }
 
-// ===== 실시간 자동 동기화 =====
-// 사이트에 들어오거나 탭에 다시 돌아왔을 때 즉시 + 주기적(2분)으로 서버 변경분을 자동 반영
-// (무료 API가 IP당 하루 50요청 제한이라 폴링 주기를 보수적으로 유지)
+// ===== 자동 동기화 =====
+// 사이트에 들어오거나 탭에 다시 돌아왔을 때 서버 변경분을 자동 반영
+// (무료 API 요청을 아끼기 위해 주기적 폴링 없이 복귀 시에만 갱신)
 let pollBusy = false;
 let lastPollAt = 0;
 async function pollAll() {
@@ -288,7 +299,6 @@ async function pollAll() {
     pollBusy = false;
   }
 }
-setInterval(pollAll, 180000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) pollAll(); });
 window.addEventListener("focus", pollAll);
 
@@ -408,9 +418,9 @@ function flushOnExit() {
     if (!sc || !sc.syncId) { dirtySchedules.delete(id); continue; }
     try {
       fetch(`${SYNC_API}/${encodeURIComponent(sc.syncId)}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: "moim-schedule", data: exportable(sc) }),
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Mantle-Key": SYNC_KEY },
+        body: jsonAscii({ name: "moim-schedule", data: exportable(sc) }),
         keepalive: true
       });
       sc.dirty = false;
