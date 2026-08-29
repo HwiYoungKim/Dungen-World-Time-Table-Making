@@ -321,6 +321,16 @@ main { max-width: 1000px; margin: 0 auto; padding: 14px; }
   max-width: 90vw;
 }
 .divider { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+#btn-save.save-dirty {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+  animation: save-pulse 2s ease-in-out infinite;
+}
+@keyframes save-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.75; }
+}
 .danger-zone { border-color: var(--danger); }
 .danger-zone h3 { color: var(--danger); margin-top: 0; }
 

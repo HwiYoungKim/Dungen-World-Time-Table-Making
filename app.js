@@ -213,7 +213,9 @@ function purgeRemovedMonths(sc) {
 }
 
 function exportable(sc) {
-  return JSON.parse(JSON.stringify(sc));
+  const copy = JSON.parse(JSON.stringify(sc));
+  delete copy.dirty;
+  return copy;
 }
 
 // 서버에서 받아 병합 후 다시 서버에 저장
@@ -228,8 +230,11 @@ async function syncSchedule(sc) {
     throw e;
   }
   if (remote) mergeSchedule(sc, remote);
-  saveStore();
   await apiPut(sc.syncId, exportable(sc));
+  sc.dirty = false;
+  dirtySchedules.delete(sc.id);
+  saveStore();
+  updateSaveBtn();
   registerCode(sc.syncId, sc.id);
   return true;
 }
@@ -347,17 +352,76 @@ async function restoreFromBackup(sc) {
   }
 }
 
-// 로컬 변경 후 자동 동기화 (디바운스)
-const syncTimers = {};
-function queueSync(sc) {
-  if (!sc.syncId) return;
-  clearTimeout(syncTimers[sc.id]);
-  syncTimers[sc.id] = setTimeout(() => {
-    syncSchedule(sc)
-      .then(() => setSyncStatus("☁️ 서버에 저장됨"))
-      .catch(e => setSyncStatus("⚠️ 동기화 실패: " + e.message));
-  }, 1500);
+// ===== 수동 저장 =====
+// 변경 사항은 로컬에 즉시 저장되고, 서버 업로드는 💾 저장 버튼을 누르거나
+// 페이지를 나가거나 닫을 때 자동으로 이루어집니다.
+const dirtySchedules = new Set();
+
+function markDirty(sc) {
+  sc.dirty = true;
+  dirtySchedules.add(sc.id);
+  saveStore();
+  updateSaveBtn();
 }
+
+function updateSaveBtn() {
+  const b = document.getElementById("btn-save");
+  if (!b) return;
+  const n = dirtySchedules.size;
+  b.disabled = n === 0;
+  b.textContent = n ? `💾 저장 (${n})` : "💾 저장됨";
+  b.classList.toggle("save-dirty", n > 0);
+}
+
+async function saveAll() {
+  const errors = [];
+  for (const id of [...dirtySchedules]) {
+    const sc = getSchedule(id);
+    if (!sc) { dirtySchedules.delete(id); continue; }
+    if (!sc.syncId) { sc.dirty = false; dirtySchedules.delete(id); continue; } // 로컬 전용 일정
+    try {
+      await syncSchedule(sc);
+    } catch (e) {
+      errors.push(`${sc.title}: ${e.message}`);
+    }
+  }
+  saveStore();
+  updateSaveBtn();
+  return errors;
+}
+
+document.getElementById("btn-save").addEventListener("click", async () => {
+  const b = document.getElementById("btn-save");
+  b.disabled = true;
+  b.textContent = "💾 저장 중...";
+  const errors = await saveAll();
+  updateSaveBtn();
+  if (errors.length) alert("일부 일정 저장에 실패했습니다.\n" + errors.join("\n"));
+  else setSyncStatus("💾 서버에 저장 완료");
+  render(true);
+});
+
+// 페이지를 나가거나 닫을 때 저장 안 된 변경을 자동 업로드 (keepalive 요청)
+function flushOnExit() {
+  for (const id of [...dirtySchedules]) {
+    const sc = getSchedule(id);
+    if (!sc || !sc.syncId) { dirtySchedules.delete(id); continue; }
+    try {
+      fetch(`${SYNC_API}/${encodeURIComponent(sc.syncId)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "moim-schedule", data: exportable(sc) }),
+        keepalive: true
+      });
+      sc.dirty = false;
+      dirtySchedules.delete(id);
+    } catch (e) { /* 최선 노력 */ }
+  }
+  saveStore();
+  updateSaveBtn();
+}
+window.addEventListener("pagehide", flushOnExit);
+document.addEventListener("visibilitychange", () => { if (document.hidden) flushOnExit(); });
 
 let syncStatusTimer = null;
 function setSyncStatus(msg) {
@@ -761,7 +825,7 @@ function renderInputTab(sc) {
       delete sc.availability[name];
       sc.availabilityMeta[name] = Date.now();
       saveStore();
-      queueSync(sc);
+      markDirty(sc);
       render();
     }
   });
@@ -772,7 +836,7 @@ function renderInputTab(sc) {
 
   const hint = document.createElement("p");
   hint.className = "hint";
-  hint.textContent = "캘린더에서 시간을 낼 수 있는 날짜를 눌러 체크하세요. 다시 누르면 해제됩니다.";
+  hint.textContent = "캘린더에서 시간을 낼 수 있는 날짜를 눌러 체크하세요. 다시 누르면 해제됩니다. 체크 후 상단의 💾 저장을 누르면 바로 업로드되고, 누르지 않아도 페이지를 나갈 때 자동으로 업로드됩니다.";
   app.appendChild(hint);
 
   const name = sc.participants[state.pIdx];
@@ -790,7 +854,7 @@ function renderInputTab(sc) {
           if (!Object.keys(my).length) delete sc.availability[name];
           sc.availabilityMeta[name] = Date.now();
           saveStore();
-          queueSync(sc);
+          markDirty(sc);
           e.currentTarget.classList.toggle("checked");
         }
       };
@@ -1000,7 +1064,7 @@ function renderShareTab(sc) {
     sc.months.sort();
     sc.monthOps[nm] = { op: "add", ts: Date.now() };
     saveStore();
-    queueSync(sc);
+    markDirty(sc);
     render();
   });
   rowMonth.appendChild(addBtn);
@@ -1056,7 +1120,7 @@ function renderShareTab(sc) {
     sc.months = sc.months.filter(ym => !target.includes(ym));
     purgeRemovedMonths(sc);
     saveStore();
-    queueSync(sc);
+    markDirty(sc);
     alert(`${label} 조사받기를 중단하고 해당 기간의 데이터를 모두 삭제했습니다.`);
     render();
   });
@@ -1086,7 +1150,7 @@ function renderShareTab(sc) {
     sc.threshold = v;
     sc.settingsTs = Date.now();
     saveStore();
-    queueSync(sc);
+    markDirty(sc);
     alert(`기준 인원이 ${v}명으로 변경되었습니다.`);
     render();
   });
@@ -1162,7 +1226,7 @@ fileImport.addEventListener("change", () => {
         mergeSchedule(existing, inc);
         if (!existing.syncId && inc.syncId) existing.syncId = inc.syncId;
         alert(`"${existing.title}" 일정에 데이터를 병합했습니다.`);
-        queueSync(existing);
+        markDirty(existing);
         state = { view: "detail", scheduleId: existing.id, tab: "result", pIdx: 0 };
       } else {
         if (!inc.id) inc.id = uid();
@@ -1180,6 +1244,9 @@ fileImport.addEventListener("change", () => {
 });
 
 // ===== 초기화 =====
+// 이전에 저장되지 않은 변경 사항 복원
+store.schedules.forEach(sc => { if (sc.dirty && sc.syncId) dirtySchedules.add(sc.id); });
+updateSaveBtn();
 applyTheme();
 render();
 autoConnectDefaults(); // 공용 일정은 코드 입력 없이 자동 연결
