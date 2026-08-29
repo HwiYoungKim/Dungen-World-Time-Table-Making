@@ -3,6 +3,10 @@
 // ===== 상수 =====
 const STORAGE_KEY = "moim-scheduler-v2";
 const SYNC_API = "https://api.restful-api.dev/objects";
+// 공유 코드 목록(레지스트리): GitHub Actions가 이 목록을 보고 저장소에 장기 백업
+const REGISTRY_ID = "ff808181a04ccf2d01a04ef24d570d14";
+// 저장소에 커밋된 장기 백업 (서버 데이터 유실 시 복구용)
+const BACKUP_RAW = "https://raw.githubusercontent.com/HwiYoungKim/Dungen-World-Time-Table-Making/main/data/backups";
 const DUNGEON_NAMES = [
   "김휘영(GM)", "강신욱", "강태웅", "김다영", "김현진", "박승한", "박현민", "배소윤",
   "서종혁", "손승미", "신재훈", "이듀태", "이형우", "조우성", "차윤석", "황수현"
@@ -133,7 +137,11 @@ function parseNames(raw) {
 // ===== 중앙 서버 동기화 =====
 async function apiGet(id) {
   const r = await fetch(`${SYNC_API}/${encodeURIComponent(id)}`);
-  if (r.status === 404) throw new Error("공유 코드를 찾을 수 없습니다.");
+  if (r.status === 404) {
+    const e = new Error("공유 코드를 찾을 수 없습니다.");
+    e.notFound = true;
+    throw e;
+  }
   if (!r.ok) throw new Error(`서버 응답 오류 (${r.status})`);
   const json = await r.json();
   return json.data || null;
@@ -211,11 +219,57 @@ function exportable(sc) {
 // 서버에서 받아 병합 후 다시 서버에 저장
 async function syncSchedule(sc) {
   if (!sc.syncId) return false;
-  const remote = await apiGet(sc.syncId);
+  let remote;
+  try {
+    remote = await apiGet(sc.syncId);
+  } catch (e) {
+    // 서버에서 데이터가 사라졌다면 GitHub 장기 백업에서 복구 시도
+    if (e.notFound && (await restoreFromBackup(sc))) return true;
+    throw e;
+  }
   if (remote) mergeSchedule(sc, remote);
   saveStore();
   await apiPut(sc.syncId, exportable(sc));
+  registerCode(sc.syncId);
   return true;
+}
+
+// 공유 코드를 레지스트리에 등록 (GitHub Actions 백업 대상 목록)
+const registeredCodes = new Set();
+async function registerCode(code) {
+  if (!code || registeredCodes.has(code)) return;
+  registeredCodes.add(code);
+  try {
+    const reg = await apiGet(REGISTRY_ID);
+    const codes = reg && Array.isArray(reg.codes) ? reg.codes : [];
+    if (!codes.includes(code)) {
+      codes.push(code);
+      await apiPut(REGISTRY_ID, { codes });
+    }
+  } catch (e) {
+    registeredCodes.delete(code); // 다음에 재시도
+    console.warn("레지스트리 등록 실패:", e);
+  }
+}
+
+// GitHub 저장소에 커밋된 백업에서 복구 → 새 서버 객체 생성
+async function restoreFromBackup(sc) {
+  try {
+    const r = await fetch(`${BACKUP_RAW}/${encodeURIComponent(sc.syncId)}.json?t=${Date.now()}`);
+    if (!r.ok) return false;
+    const backup = await r.json();
+    if (!backup || !Array.isArray(backup.participants)) return false;
+    mergeSchedule(sc, backup);
+    const newId = await apiCreate(exportable(sc));
+    sc.syncId = newId;
+    saveStore();
+    registerCode(newId);
+    alert(`⚠️ 임시 서버에서 데이터가 사라져 GitHub 장기 백업에서 복구했습니다.\n\n새 공유 코드: ${newId}\n\n다른 참가자에게 새 코드를 다시 공유해 주세요. (기존 코드는 더 이상 동작하지 않습니다)`);
+    return true;
+  } catch (e) {
+    console.warn("백업 복구 실패:", e);
+    return false;
+  }
 }
 
 // 로컬 변경 후 자동 동기화 (디바운스)
@@ -241,7 +295,27 @@ function setSyncStatus(msg) {
 }
 
 async function connectByCode(code) {
-  const remote = await apiGet(code);
+  let remote;
+  try {
+    remote = await apiGet(code);
+  } catch (e) {
+    // 서버에 없으면 GitHub 장기 백업에서 가져오기 시도
+    if (!e.notFound) throw e;
+    const r = await fetch(`${BACKUP_RAW}/${encodeURIComponent(code)}.json?t=${Date.now()}`);
+    if (!r.ok) throw e;
+    remote = await r.json();
+    if (!remote || !Array.isArray(remote.participants)) throw e;
+    // 백업 데이터로 새 서버 객체를 만들어 계속 공유 가능하게
+    normalizeSchedule(remote);
+    const newId = await apiCreate(remote);
+    let sc = getSchedule(remote.id);
+    if (sc) { sc.syncId = newId; mergeSchedule(sc, remote); }
+    else { remote.syncId = newId; store.schedules.push(remote); sc = remote; }
+    saveStore();
+    registerCode(newId);
+    alert(`⚠️ 임시 서버에서 데이터가 사라져 GitHub 장기 백업에서 복구했습니다.\n\n새 공유 코드: ${newId}\n\n다른 참가자에게 새 코드를 다시 공유해 주세요.`);
+    return sc;
+  }
   if (!remote || !Array.isArray(remote.participants)) {
     throw new Error("해당 코드에 올바른 일정 데이터가 없습니다.");
   }
@@ -257,6 +331,7 @@ async function connectByCode(code) {
   }
   saveStore();
   await apiPut(code, exportable(sc));
+  registerCode(code);
   return sc;
 }
 
@@ -800,6 +875,7 @@ function renderShareTab(sc) {
         const id = await apiCreate(exportable(sc));
         sc.syncId = id;
         saveStore();
+        registerCode(id);
         render();
       } catch (e) {
         alert("공유 코드 생성 실패: " + e.message);
