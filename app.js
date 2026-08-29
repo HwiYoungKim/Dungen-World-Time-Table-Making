@@ -234,6 +234,59 @@ async function syncSchedule(sc) {
   return true;
 }
 
+// 폴링용: 서버에서 받아 병합만 (변경이 있었는지 반환)
+async function pullSchedule(sc) {
+  if (!sc.syncId) return false;
+  let remote;
+  try {
+    remote = await apiGet(sc.syncId);
+  } catch (e) {
+    if (e.notFound) return restoreFromBackup(sc);
+    throw e;
+  }
+  if (!remote) return false;
+  const before = JSON.stringify(exportable(sc));
+  mergeSchedule(sc, remote);
+  if (JSON.stringify(exportable(sc)) === before) return false;
+  saveStore();
+  return true;
+}
+
+// ===== 실시간 자동 동기화 =====
+// 사이트에 들어오거나 탭에 다시 돌아왔을 때 즉시 + 주기적(2분)으로 서버 변경분을 자동 반영
+// (무료 API가 IP당 하루 50요청 제한이라 폴링 주기를 보수적으로 유지)
+let pollBusy = false;
+let lastPollAt = 0;
+async function pollAll() {
+  if (pollBusy || document.hidden) return;
+  if (Date.now() - lastPollAt < 30000) return; // 과도한 요청 방지
+  pollBusy = true;
+  lastPollAt = Date.now();
+  try {
+    let changed = false;
+    for (const sc of store.schedules) {
+      if (!sc.syncId) continue;
+      try {
+        if (await pullSchedule(sc)) changed = true;
+      } catch (e) {
+        console.warn("자동 동기화 실패:", e);
+      }
+    }
+    if (changed) {
+      // 입력 중일 때는 화면을 다시 그리지 않음 (입력 내용 보호)
+      const ae = document.activeElement;
+      const editing = ae && ["INPUT", "TEXTAREA", "SELECT"].includes(ae.tagName);
+      if (!editing) render(true);
+      setSyncStatus("☁️ 다른 참가자의 변경이 반영됨");
+    }
+  } finally {
+    pollBusy = false;
+  }
+}
+setInterval(pollAll, 180000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) pollAll(); });
+window.addEventListener("focus", pollAll);
+
 // 공유 코드를 레지스트리에 등록 (GitHub Actions 백업 대상 목록)
 // defaultId를 주면 "기본 일정 → 현재 코드" 포인터도 함께 갱신 (모두 자동 연결용)
 const registeredCodes = new Set();
@@ -266,7 +319,7 @@ async function autoConnectDefaults() {
       const sc = getSchedule(schedId);
       if (!sc || !code) continue;
       if (sc.syncId !== code) { sc.syncId = code; changed = true; }
-      try { await syncSchedule(sc); changed = true; } catch (e) { console.warn("자동 연결 동기화 실패:", e); }
+      try { if (await pullSchedule(sc)) changed = true; } catch (e) { console.warn("자동 연결 동기화 실패:", e); }
     }
     if (changed) { saveStore(); render(); setSyncStatus("☁️ 공용 일정 자동 연결됨"); }
   } catch (e) {
@@ -466,12 +519,12 @@ function heatColor(count, total) {
 // ===== 렌더링 =====
 const app = document.getElementById("app");
 
-function render() {
+function render(keepScroll) {
   app.innerHTML = "";
   if (state.view === "home") renderHome();
   else if (state.view === "new") renderNewForm();
   else if (state.view === "detail") renderDetail();
-  window.scrollTo(0, 0);
+  if (!keepScroll) window.scrollTo(0, 0);
 }
 
 // ----- 홈 -----
@@ -754,7 +807,7 @@ function renderResultTab(sc) {
   const reloadHint = document.createElement("p");
   reloadHint.className = "hint";
   reloadHint.textContent = sc.syncId
-    ? "다른 사람이 체크를 업데이트했다면 상단의 🔄 새로고침을 눌러 서버의 최신 결과를 확인하세요."
+    ? "다른 참가자의 변경은 30초마다, 그리고 사이트에 다시 들어올 때 자동으로 반영됩니다. 즉시 확인하려면 상단 🔄 새로고침을 누르세요."
     : "이 일정은 아직 실시간 공유가 꺼져 있습니다. [공유/설정]에서 공유 코드를 만들면 모두가 같은 데이터를 보게 됩니다.";
   app.appendChild(reloadHint);
 

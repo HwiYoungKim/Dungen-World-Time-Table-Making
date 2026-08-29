@@ -20,8 +20,10 @@
 
 <main id="app"></main>
 
+<div id="sync-status" hidden></div>
+
 <footer>
-  <p>데이터는 이 브라우저의 localStorage에 자동 저장됩니다. 다른 사람과 합치려면 각 일정의 [공유/설정] 탭에서 JSON 내보내기/가져오기를 사용하세요.</p>
+  <p>데이터는 서버에 자동 동기화되고 GitHub 저장소에 주기적으로 백업됩니다. 브라우저(localStorage)에도 사본이 저장됩니다.</p>
 </footer>
 
 <input type="file" id="file-import" accept=".json,application/json" hidden>
