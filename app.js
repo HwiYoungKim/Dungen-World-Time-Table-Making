@@ -230,25 +230,47 @@ async function syncSchedule(sc) {
   if (remote) mergeSchedule(sc, remote);
   saveStore();
   await apiPut(sc.syncId, exportable(sc));
-  registerCode(sc.syncId);
+  registerCode(sc.syncId, sc.id);
   return true;
 }
 
 // 공유 코드를 레지스트리에 등록 (GitHub Actions 백업 대상 목록)
+// defaultId를 주면 "기본 일정 → 현재 코드" 포인터도 함께 갱신 (모두 자동 연결용)
 const registeredCodes = new Set();
-async function registerCode(code) {
-  if (!code || registeredCodes.has(code)) return;
-  registeredCodes.add(code);
+async function registerCode(code, defaultId) {
+  const key = code + "|" + (defaultId || "");
+  if (!code || registeredCodes.has(key)) return;
+  registeredCodes.add(key);
+  try {
+    const reg = (await apiGet(REGISTRY_ID)) || {};
+    const codes = Array.isArray(reg.codes) ? reg.codes : [];
+    const defaults = reg.defaults && typeof reg.defaults === "object" ? reg.defaults : {};
+    let dirty = false;
+    if (!codes.includes(code)) { codes.push(code); dirty = true; }
+    if (defaultId && defaults[defaultId] !== code) { defaults[defaultId] = code; dirty = true; }
+    if (dirty) await apiPut(REGISTRY_ID, { ...reg, codes, defaults });
+  } catch (e) {
+    registeredCodes.delete(key); // 다음에 재시도
+    console.warn("레지스트리 등록 실패:", e);
+  }
+}
+
+// 기본(공용) 일정은 코드 입력 없이 자동으로 서버에 연결
+async function autoConnectDefaults() {
   try {
     const reg = await apiGet(REGISTRY_ID);
-    const codes = reg && Array.isArray(reg.codes) ? reg.codes : [];
-    if (!codes.includes(code)) {
-      codes.push(code);
-      await apiPut(REGISTRY_ID, { codes });
+    const defaults = reg && reg.defaults;
+    if (!defaults) return;
+    let changed = false;
+    for (const [schedId, code] of Object.entries(defaults)) {
+      const sc = getSchedule(schedId);
+      if (!sc || !code) continue;
+      if (sc.syncId !== code) { sc.syncId = code; changed = true; }
+      try { await syncSchedule(sc); changed = true; } catch (e) { console.warn("자동 연결 동기화 실패:", e); }
     }
+    if (changed) { saveStore(); render(); setSyncStatus("☁️ 공용 일정 자동 연결됨"); }
   } catch (e) {
-    registeredCodes.delete(code); // 다음에 재시도
-    console.warn("레지스트리 등록 실패:", e);
+    console.warn("자동 연결 실패:", e);
   }
 }
 
@@ -263,8 +285,8 @@ async function restoreFromBackup(sc) {
     const newId = await apiCreate(exportable(sc));
     sc.syncId = newId;
     saveStore();
-    registerCode(newId);
-    alert(`⚠️ 임시 서버에서 데이터가 사라져 GitHub 장기 백업에서 복구했습니다.\n\n새 공유 코드: ${newId}\n\n다른 참가자에게 새 코드를 다시 공유해 주세요. (기존 코드는 더 이상 동작하지 않습니다)`);
+    await registerCode(newId, sc.id);
+    alert(`⚠️ 임시 서버에서 데이터가 사라져 GitHub 장기 백업에서 복구했습니다.\n\n새 공유 코드: ${newId}\n\n공용(기본) 일정은 모두에게 자동으로 다시 연결됩니다. 직접 코드로 공유하던 일정이라면 새 코드를 다시 공유해 주세요.`);
     return true;
   } catch (e) {
     console.warn("백업 복구 실패:", e);
@@ -312,8 +334,8 @@ async function connectByCode(code) {
     if (sc) { sc.syncId = newId; mergeSchedule(sc, remote); }
     else { remote.syncId = newId; store.schedules.push(remote); sc = remote; }
     saveStore();
-    registerCode(newId);
-    alert(`⚠️ 임시 서버에서 데이터가 사라져 GitHub 장기 백업에서 복구했습니다.\n\n새 공유 코드: ${newId}\n\n다른 참가자에게 새 코드를 다시 공유해 주세요.`);
+    registerCode(newId, sc.id);
+    alert(`⚠️ 임시 서버에서 데이터가 사라져 GitHub 장기 백업에서 복구했습니다.\n\n새 공유 코드: ${newId}\n\n다른 참가자에게는 자동으로 다시 연결됩니다.`);
     return sc;
   }
   if (!remote || !Array.isArray(remote.participants)) {
@@ -331,7 +353,7 @@ async function connectByCode(code) {
   }
   saveStore();
   await apiPut(code, exportable(sc));
-  registerCode(code);
+  registerCode(code, sc.id);
   return sc;
 }
 
@@ -875,7 +897,7 @@ function renderShareTab(sc) {
         const id = await apiCreate(exportable(sc));
         sc.syncId = id;
         saveStore();
-        registerCode(id);
+        registerCode(id, sc.id);
         render();
       } catch (e) {
         alert("공유 코드 생성 실패: " + e.message);
@@ -1107,3 +1129,4 @@ fileImport.addEventListener("change", () => {
 // ===== 초기화 =====
 applyTheme();
 render();
+autoConnectDefaults(); // 공용 일정은 코드 입력 없이 자동 연결
