@@ -1,12 +1,15 @@
 "use strict";
 
-// ===== 저장소 =====
+// ===== 상수 =====
 const STORAGE_KEY = "moim-scheduler-v2";
+const SYNC_API = "https://api.restful-api.dev/objects";
 const DUNGEON_NAMES = [
   "김휘영(GM)", "강신욱", "강태웅", "김다영", "김현진", "박승한", "박현민", "배소윤",
   "서종혁", "손승미", "신재훈", "이듀태", "이형우", "조우성", "차윤석", "황수현"
 ];
 const DAY_NAMES = ["일", "월", "화", "수", "목", "금", "토"];
+// 초성/중성만 따로 있는 미완성 한글 (예: ㅐ, ㅋ) 감지
+const JAMO_RE = /[\u3131-\u318E\u1100-\u11FF\uA960-\uA97F\uD7B0-\uD7FF]/;
 
 let store = loadStore();
 let state = { view: "home", scheduleId: null, tab: "input", pIdx: 0 };
@@ -15,6 +18,12 @@ function uid() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 9);
 }
 
+function currentYm() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+}
+
+// ===== 저장소 =====
 function defaultStore() {
   return { deviceId: uid(), theme: "auto", schedules: [] };
 }
@@ -45,13 +54,17 @@ function seed(s) {
     participants: DUNGEON_NAMES.slice(),
     availability: {}
   });
+  s.schedules.forEach(normalizeSchedule);
   return s;
 }
 
 function normalizeSchedule(sc) {
-  if (!Array.isArray(sc.months) || !sc.months.length) sc.months = ["2026-09"];
+  if (!Array.isArray(sc.months) || !sc.months.length) sc.months = [currentYm()];
   if (!Array.isArray(sc.participants)) sc.participants = [];
   if (!sc.availability || typeof sc.availability !== "object") sc.availability = {};
+  if (!sc.availabilityMeta || typeof sc.availabilityMeta !== "object") sc.availabilityMeta = {};
+  if (!sc.monthOps || typeof sc.monthOps !== "object") sc.monthOps = {};
+  if (typeof sc.settingsTs !== "number") sc.settingsTs = 0;
   if (typeof sc.threshold !== "number" || sc.threshold < 1) sc.threshold = 3;
   sc.months.sort();
 }
@@ -94,7 +107,6 @@ function monthRangeLabel(months) {
   return `${ymLabel(months[0])} ~ ${ymLabel(months[months.length - 1])}`;
 }
 
-// 날짜별 가능 인원: { "2026-09-02": ["이름", ...] }
 function dateCounts(sc) {
   const counts = {};
   for (const name of sc.participants) {
@@ -105,6 +117,147 @@ function dateCounts(sc) {
     }
   }
   return counts;
+}
+
+// 명단 파싱: 중복 자동 제거 + 미완성 한글 검사
+function parseNames(raw) {
+  let names = raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+  const malformed = names.filter(n => JAMO_RE.test(n));
+  if (malformed.length) {
+    return { error: `이름에 완성되지 않은 한글(자음/모음만 있는 글자)이 포함되어 있습니다: ${malformed.join(", ")}\n이름란을 다시 입력해 주세요.` };
+  }
+  names = [...new Set(names)]; // 중복 자동 제거
+  return { names };
+}
+
+// ===== 중앙 서버 동기화 =====
+async function apiGet(id) {
+  const r = await fetch(`${SYNC_API}/${encodeURIComponent(id)}`);
+  if (r.status === 404) throw new Error("공유 코드를 찾을 수 없습니다.");
+  if (!r.ok) throw new Error(`서버 응답 오류 (${r.status})`);
+  const json = await r.json();
+  return json.data || null;
+}
+
+async function apiPut(id, data) {
+  const r = await fetch(`${SYNC_API}/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "moim-schedule", data })
+  });
+  if (!r.ok) throw new Error(`서버 저장 실패 (${r.status})`);
+}
+
+async function apiCreate(data) {
+  const r = await fetch(SYNC_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "moim-schedule", data })
+  });
+  if (!r.ok) throw new Error(`서버 생성 실패 (${r.status})`);
+  const json = await r.json();
+  return json.id;
+}
+
+// 병합: 서버/다른 기기 데이터와 로컬 데이터 합치기
+function mergeSchedule(local, inc) {
+  normalizeSchedule(inc);
+  // 설정(이름/기준인원/참가자)은 더 최근 변경이 우선
+  if ((inc.settingsTs || 0) > (local.settingsTs || 0)) {
+    local.title = inc.title;
+    local.threshold = inc.threshold;
+    local.participants = inc.participants;
+    local.settingsTs = inc.settingsTs;
+  }
+  // 월 추가/삭제 이력: 월별로 더 최근 작업이 우선
+  const ops = { ...local.monthOps };
+  for (const [ym, op] of Object.entries(inc.monthOps || {})) {
+    if (!ops[ym] || op.ts > ops[ym].ts) ops[ym] = op;
+  }
+  local.monthOps = ops;
+  const cand = new Set([...local.months, ...inc.months, ...Object.keys(ops)]);
+  local.months = [...cand].filter(ym => !(ops[ym] && ops[ym].op === "del")).sort();
+  if (!local.months.length) local.months = [currentYm()];
+  // 가능 날짜: 참가자별로 더 최근에 수정한 쪽이 우선
+  const metaL = local.availabilityMeta, metaI = inc.availabilityMeta || {};
+  const names = new Set([...Object.keys(local.availability), ...Object.keys(inc.availability || {})]);
+  for (const n of names) {
+    const tl = metaL[n] || 0, ti = metaI[n] || 0;
+    if (ti > tl) {
+      local.availability[n] = { ...(inc.availability[n] || {}) };
+      metaL[n] = ti;
+    } else if (tl === 0 && ti === 0) {
+      local.availability[n] = { ...(inc.availability[n] || {}), ...(local.availability[n] || {}) };
+    }
+  }
+  purgeRemovedMonths(local);
+}
+
+// 조회 중단된 월의 체크 데이터 제거
+function purgeRemovedMonths(sc) {
+  const live = new Set(sc.months);
+  for (const n of Object.keys(sc.availability)) {
+    for (const d of Object.keys(sc.availability[n])) {
+      if (!live.has(d.slice(0, 7))) delete sc.availability[n][d];
+    }
+    if (!Object.keys(sc.availability[n]).length) delete sc.availability[n];
+  }
+}
+
+function exportable(sc) {
+  return JSON.parse(JSON.stringify(sc));
+}
+
+// 서버에서 받아 병합 후 다시 서버에 저장
+async function syncSchedule(sc) {
+  if (!sc.syncId) return false;
+  const remote = await apiGet(sc.syncId);
+  if (remote) mergeSchedule(sc, remote);
+  saveStore();
+  await apiPut(sc.syncId, exportable(sc));
+  return true;
+}
+
+// 로컬 변경 후 자동 동기화 (디바운스)
+const syncTimers = {};
+function queueSync(sc) {
+  if (!sc.syncId) return;
+  clearTimeout(syncTimers[sc.id]);
+  syncTimers[sc.id] = setTimeout(() => {
+    syncSchedule(sc)
+      .then(() => setSyncStatus("☁️ 서버에 저장됨"))
+      .catch(e => setSyncStatus("⚠️ 동기화 실패: " + e.message));
+  }, 1500);
+}
+
+let syncStatusTimer = null;
+function setSyncStatus(msg) {
+  const el = document.getElementById("sync-status");
+  if (!el) return;
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(syncStatusTimer);
+  syncStatusTimer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+async function connectByCode(code) {
+  const remote = await apiGet(code);
+  if (!remote || !Array.isArray(remote.participants)) {
+    throw new Error("해당 코드에 올바른 일정 데이터가 없습니다.");
+  }
+  let sc = getSchedule(remote.id);
+  if (sc) {
+    sc.syncId = code;
+    mergeSchedule(sc, remote);
+  } else {
+    normalizeSchedule(remote);
+    remote.syncId = code;
+    store.schedules.push(remote);
+    sc = remote;
+  }
+  saveStore();
+  await apiPut(code, exportable(sc));
+  return sc;
 }
 
 // ===== 테마 =====
@@ -125,15 +278,30 @@ document.getElementById("btn-theme").addEventListener("click", () => {
   applyTheme();
 });
 
-// ===== 새로고침 (수동 reload) =====
-document.getElementById("btn-reload").addEventListener("click", () => {
-  store = loadStore();
+// ===== 새로고침: 서버에서 최신 데이터 받아오기 =====
+document.getElementById("btn-reload").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-reload");
+  btn.disabled = true;
+  btn.textContent = "🔄 동기화 중...";
+  store = loadStore(); // 다른 탭 변경분 반영
+  const errors = [];
+  for (const sc of store.schedules) {
+    if (!sc.syncId) continue;
+    try {
+      await syncSchedule(sc);
+    } catch (e) {
+      errors.push(`${sc.title}: ${e.message}`);
+    }
+  }
+  btn.disabled = false;
+  btn.textContent = "🔄 새로고침";
   applyTheme();
   render();
+  if (errors.length) alert("일부 일정 동기화에 실패했습니다.\n" + errors.join("\n"));
+  else setSyncStatus("☁️ 최신 데이터로 갱신됨");
 });
 
 // ===== 캘린더 빌더 =====
-// cellFn(iso) -> { classes: [], html: "", onClick: fn } | null
 function buildCalendar(ym, cellFn) {
   const [y, m] = ym.split("-").map(Number);
   const daysInMonth = new Date(y, m, 0).getDate();
@@ -194,7 +362,7 @@ function buildCalendar(ym, cellFn) {
 function heatColor(count, total) {
   if (count === 0) return "";
   const ratio = Math.min(count / total, 1);
-  const light = 90 - ratio * 55; // 90% → 35%
+  const light = 90 - ratio * 55;
   return `hsl(243, 70%, ${light}%)`;
 }
 
@@ -237,28 +405,60 @@ function renderHome() {
       <h3>${escapeHtml(sc.title)}</h3>
       <div class="schedule-meta">
         ${sc.creatorId === store.deviceId ? '<span class="badge">내가 만든 일정</span>' : ""}
+        ${sc.syncId ? '<span class="badge">🌐 실시간 공유중</span>' : ""}
         <span class="badge">${sc.participants.length}명</span>
         <span class="badge">${sc.threshold}인 이상 기준</span><br>
         기간: ${monthRangeLabel(sc.months)} · 가능 날짜 ${okDays}일 발견
       </div>`;
     card.addEventListener("click", () => {
-      state = { view: "detail", scheduleId: sc.id, tab: "input", pIdx: 0 };
+      // 기본 화면: 가능한 날짜 캘린더 보기
+      state = { view: "detail", scheduleId: sc.id, tab: "result", pIdx: 0 };
       render();
     });
     app.appendChild(card);
   }
 
-  // 홈에서 JSON 가져오기 (다른 사람이 만든 일정 받기)
-  const importCard = document.createElement("div");
-  importCard.className = "card";
-  importCard.innerHTML = `<div class="schedule-meta">다른 사람에게 받은 일정 파일이 있나요?</div>`;
+  // 공유 코드로 일정 가져오기
+  const codeCard = document.createElement("div");
+  codeCard.className = "card";
+  codeCard.innerHTML = `
+    <h3 style="margin:0 0 6px;font-size:0.95rem">🌐 공유 코드로 일정 가져오기</h3>
+    <p class="hint" style="margin-top:0">일정을 만든 사람에게 받은 공유 코드를 입력하면 같은 일정에 함께 참여할 수 있습니다.</p>`;
+  const row = document.createElement("div");
+  row.className = "settings-row";
+  const codeInput = document.createElement("input");
+  codeInput.type = "text";
+  codeInput.placeholder = "공유 코드 입력";
+  codeInput.className = "text-input";
+  const codeBtn = document.createElement("button");
+  codeBtn.className = "btn";
+  codeBtn.textContent = "가져오기";
+  codeBtn.addEventListener("click", async () => {
+    const code = codeInput.value.trim();
+    if (!code) { alert("공유 코드를 입력해 주세요."); return; }
+    codeBtn.disabled = true;
+    codeBtn.textContent = "가져오는 중...";
+    try {
+      const sc = await connectByCode(code);
+      state = { view: "detail", scheduleId: sc.id, tab: "result", pIdx: 0 };
+      render();
+    } catch (e) {
+      alert("가져오기 실패: " + e.message);
+      codeBtn.disabled = false;
+      codeBtn.textContent = "가져오기";
+    }
+  });
+  row.appendChild(codeInput);
+  row.appendChild(codeBtn);
+  codeCard.appendChild(row);
+
   const impBtn = document.createElement("button");
   impBtn.className = "btn btn-small";
-  impBtn.style.marginTop = "8px";
-  impBtn.textContent = "📥 일정 JSON 가져오기";
+  impBtn.style.marginTop = "6px";
+  impBtn.textContent = "📥 파일(JSON)로 가져오기";
   impBtn.addEventListener("click", () => startImport());
-  importCard.appendChild(impBtn);
-  app.appendChild(importCard);
+  codeCard.appendChild(impBtn);
+  app.appendChild(codeCard);
 }
 
 // ----- 새 일정 폼 -----
@@ -273,17 +473,17 @@ function renderNewForm() {
     </div>
     <div class="form-field">
       <label for="f-names">참가자 명단 (쉼표 또는 줄바꿈으로 구분)</label>
-      <textarea id="f-names" placeholder="김휘영(GM), 강신욱, 강태웅, ..."></textarea>
-      <div class="form-hint">입력한 이름 수만큼 인원이 등록됩니다.</div>
+      <textarea id="f-names" placeholder="김휘영,잘생김,카리스마..."></textarea>
+      <div class="form-hint">입력한 이름 수만큼 인원이 등록됩니다. 중복된 이름은 자동으로 하나만 남깁니다.</div>
     </div>
     <div class="form-field">
       <label for="f-start">일정을 물어볼 기간 — 시작 월</label>
-      <input id="f-start" type="month" value="2026-09" min="2020-01" max="2099-12">
+      <input id="f-start" type="month" value="${currentYm()}" min="2020-01" max="2099-12">
     </div>
     <div class="form-field">
       <label for="f-months">기간 (개월 수)</label>
       <input id="f-months" type="number" value="1" min="1" max="12">
-      <div class="form-hint">예: 시작 월 2026-09 + 2개월 → 9월, 10월 두 달을 조사합니다. 나중에 설정에서 달을 더 추가할 수도 있습니다.</div>
+      <div class="form-hint">나중에 설정에서 달을 더 추가하거나 줄일 수 있습니다.</div>
     </div>
     <div class="form-field">
       <label for="f-threshold">몇 명 이상 모이면 "가능한 날짜"로 볼까요?</label>
@@ -302,15 +502,15 @@ function renderNewForm() {
 
   card.querySelector("#f-submit").addEventListener("click", () => {
     const title = card.querySelector("#f-title").value.trim();
-    const names = card.querySelector("#f-names").value
-      .split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+    const parsed = parseNames(card.querySelector("#f-names").value);
+    if (parsed.error) { alert(parsed.error); return; }
+    const names = parsed.names;
     const startYm = card.querySelector("#f-start").value;
     const monthCount = Math.max(1, Math.min(12, +card.querySelector("#f-months").value || 1));
     const threshold = Math.max(1, +card.querySelector("#f-threshold").value || 3);
 
     if (!title) { alert("일정 이름을 입력해 주세요."); return; }
     if (names.length < 2) { alert("참가자를 2명 이상 입력해 주세요."); return; }
-    if (new Set(names).size !== names.length) { alert("중복된 이름이 있습니다. 이름은 서로 달라야 합니다."); return; }
     if (!/^\d{4}-\d{2}$/.test(startYm)) { alert("시작 월을 선택해 주세요."); return; }
     if (threshold > names.length) { alert("기준 인원이 참가자 수보다 많습니다."); return; }
 
@@ -326,7 +526,10 @@ function renderNewForm() {
       threshold,
       months,
       participants: names,
-      availability: {}
+      availability: {},
+      availabilityMeta: {},
+      monthOps: {},
+      settingsTs: Date.now()
     };
     store.schedules.push(sc);
     saveStore();
@@ -350,13 +553,18 @@ function renderDetail() {
   h2.textContent = sc.title;
   head.appendChild(backBtn);
   head.appendChild(h2);
+  const syncStatus = document.createElement("span");
+  syncStatus.id = "sync-status";
+  syncStatus.className = "hint";
+  syncStatus.hidden = true;
+  head.appendChild(syncStatus);
   app.appendChild(head);
 
   const tabs = document.createElement("div");
   tabs.className = "tabs";
   const tabDefs = [
-    ["input", "✏️ 날짜 체크"],
     ["result", "🗓️ 가능한 날짜 보기"],
+    ["input", "✏️ 날짜 체크"],
     ["share", "⚙️ 공유/설정"]
   ];
   for (const [key, label] of tabDefs) {
@@ -401,7 +609,9 @@ function renderInputTab(sc) {
     const name = sc.participants[state.pIdx];
     if (confirm(`"${name}"의 체크를 모두 지울까요?`)) {
       delete sc.availability[name];
+      sc.availabilityMeta[name] = Date.now();
       saveStore();
+      queueSync(sc);
       render();
     }
   });
@@ -428,9 +638,10 @@ function renderInputTab(sc) {
           if (my[iso]) delete my[iso];
           else my[iso] = true;
           if (!Object.keys(my).length) delete sc.availability[name];
+          sc.availabilityMeta[name] = Date.now();
           saveStore();
-          const td = e.currentTarget;
-          td.classList.toggle("checked");
+          queueSync(sc);
+          e.currentTarget.classList.toggle("checked");
         }
       };
     }));
@@ -438,45 +649,19 @@ function renderInputTab(sc) {
   app.appendChild(grid);
 }
 
-// ----- 결과 탭 -----
+// ----- 결과 탭 (기본 화면) -----
 function renderResultTab(sc) {
   const counts = dateCounts(sc);
   const total = sc.participants.length;
 
   const reloadHint = document.createElement("p");
   reloadHint.className = "hint";
-  reloadHint.textContent = "다른 사람이 업데이트한 데이터를 가져왔다면 상단의 🔄 새로고침을 눌러 최신 결과를 확인하세요.";
+  reloadHint.textContent = sc.syncId
+    ? "다른 사람이 체크를 업데이트했다면 상단의 🔄 새로고침을 눌러 서버의 최신 결과를 확인하세요."
+    : "이 일정은 아직 실시간 공유가 꺼져 있습니다. [공유/설정]에서 공유 코드를 만들면 모두가 같은 데이터를 보게 됩니다.";
   app.appendChild(reloadHint);
 
-  // 가능한 날짜 목록
-  const listCard = document.createElement("div");
-  listCard.className = "card";
-  listCard.innerHTML = `<h3 style="margin-top:0">✅ ${sc.threshold}인 이상 가능한 날짜 (모든 경우)</h3>`;
-  const okDates = Object.keys(counts)
-    .filter(d => counts[d].length >= sc.threshold)
-    .sort();
-  const maxCount = okDates.reduce((m, d) => Math.max(m, counts[d].length), 0);
-
-  const ul = document.createElement("ul");
-  ul.className = "result-list";
-  if (!okDates.length) {
-    const li = document.createElement("li");
-    li.textContent = `아직 ${sc.threshold}인 이상 가능한 날짜가 없습니다.`;
-    ul.appendChild(li);
-  } else {
-    for (const d of okDates) {
-      const names = counts[d];
-      const li = document.createElement("li");
-      if (names.length === maxCount) li.classList.add("best");
-      li.innerHTML = `<span class="date-label">${dateLabel(d)}</span> — 가능인원 ${names.length}명${names.length === maxCount ? " 🏆" : ""}<br>` +
-        names.map(n => `<span class="name-chip">${escapeHtml(n)}</span>`).join("");
-      ul.appendChild(li);
-    }
-  }
-  listCard.appendChild(ul);
-  app.appendChild(listCard);
-
-  // 캘린더 시각화
+  // 캘린더 시각화 (기본으로 먼저 표시)
   const legend = document.createElement("div");
   legend.className = "legend";
   legend.innerHTML =
@@ -511,7 +696,6 @@ function renderResultTab(sc) {
       };
     }));
   }
-  // 히트맵 색상 적용 (buildCalendar 이후 인라인 스타일)
   grid.querySelectorAll("td.clickable").forEach(td => {
     const daynum = td.querySelector(".daynum");
     const pill = td.querySelector(".count-pill");
@@ -521,25 +705,122 @@ function renderResultTab(sc) {
     if (c / total > 0.45) {
       td.style.color = "#fff";
       if (daynum) daynum.style.color = "#fff";
-    } else {
-      td.style.color = "";
     }
   });
   app.appendChild(grid);
   app.appendChild(detail);
+
+  // 가능한 날짜 목록 (모든 경우의 수)
+  const listCard = document.createElement("div");
+  listCard.className = "card";
+  listCard.innerHTML = `<h3 style="margin-top:0">✅ ${sc.threshold}인 이상 가능한 날짜 (모든 경우)</h3>`;
+  const okDates = Object.keys(counts)
+    .filter(d => counts[d].length >= sc.threshold)
+    .sort();
+  const maxCount = okDates.reduce((m, d) => Math.max(m, counts[d].length), 0);
+
+  const ul = document.createElement("ul");
+  ul.className = "result-list";
+  if (!okDates.length) {
+    const li = document.createElement("li");
+    li.textContent = `아직 ${sc.threshold}인 이상 가능한 날짜가 없습니다.`;
+    ul.appendChild(li);
+  } else {
+    for (const d of okDates) {
+      const names = counts[d];
+      const li = document.createElement("li");
+      if (names.length === maxCount) li.classList.add("best");
+      li.innerHTML = `<span class="date-label">${dateLabel(d)}</span> — 가능인원 ${names.length}명${names.length === maxCount ? " 🏆" : ""}<br>` +
+        names.map(n => `<span class="name-chip">${escapeHtml(n)}</span>`).join("");
+      ul.appendChild(li);
+    }
+  }
+  listCard.appendChild(ul);
+  app.appendChild(listCard);
 }
 
 // ----- 공유/설정 탭 -----
 function renderShareTab(sc) {
+  // 실시간 공유 (중앙 서버)
+  const syncCard = document.createElement("div");
+  syncCard.className = "card";
+  syncCard.innerHTML = `<h3 style="margin-top:0">🌐 실시간 공유 (중앙 서버)</h3>`;
+  if (sc.syncId) {
+    syncCard.insertAdjacentHTML("beforeend",
+      `<p class="hint">이 일정은 서버와 동기화 중입니다. 체크/월 추가/조회 중단이 모두에게 반영됩니다. 아래 공유 코드를 다른 참가자에게 알려주세요.</p>`);
+    const row = document.createElement("div");
+    row.className = "settings-row";
+    const codeBox = document.createElement("input");
+    codeBox.type = "text";
+    codeBox.readOnly = true;
+    codeBox.value = sc.syncId;
+    codeBox.className = "text-input";
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "btn btn-small";
+    copyBtn.textContent = "📋 복사";
+    copyBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(sc.syncId);
+        copyBtn.textContent = "✅ 복사됨";
+        setTimeout(() => { copyBtn.textContent = "📋 복사"; }, 1500);
+      } catch {
+        codeBox.select();
+        document.execCommand("copy");
+      }
+    });
+    const syncNowBtn = document.createElement("button");
+    syncNowBtn.className = "btn btn-small";
+    syncNowBtn.textContent = "☁️ 지금 동기화";
+    syncNowBtn.addEventListener("click", async () => {
+      syncNowBtn.disabled = true;
+      syncNowBtn.textContent = "동기화 중...";
+      try {
+        await syncSchedule(sc);
+        render();
+      } catch (e) {
+        alert("동기화 실패: " + e.message);
+        syncNowBtn.disabled = false;
+        syncNowBtn.textContent = "☁️ 지금 동기화";
+      }
+    });
+    row.appendChild(codeBox);
+    row.appendChild(copyBtn);
+    row.appendChild(syncNowBtn);
+    syncCard.appendChild(row);
+  } else {
+    syncCard.insertAdjacentHTML("beforeend",
+      `<p class="hint">공유 코드를 만들면 모든 참가자가 같은 데이터를 실시간으로 공유합니다. 누가 월을 추가/삭제해도 모두에게 반영됩니다.</p>`);
+    const makeBtn = document.createElement("button");
+    makeBtn.className = "btn btn-primary";
+    makeBtn.textContent = "🌐 공유 코드 만들기";
+    makeBtn.addEventListener("click", async () => {
+      makeBtn.disabled = true;
+      makeBtn.textContent = "만드는 중...";
+      try {
+        const id = await apiCreate(exportable(sc));
+        sc.syncId = id;
+        saveStore();
+        render();
+      } catch (e) {
+        alert("공유 코드 생성 실패: " + e.message);
+        makeBtn.disabled = false;
+        makeBtn.textContent = "🌐 공유 코드 만들기";
+      }
+    });
+    syncCard.appendChild(makeBtn);
+  }
+  app.appendChild(syncCard);
+
+  // 파일 공유
   const shareCard = document.createElement("div");
   shareCard.className = "card";
-  shareCard.innerHTML = `<h3 style="margin-top:0">📤 데이터 공유</h3>
-    <p class="hint">각자 체크한 뒤 JSON을 내보내 한 사람에게 모으고, 그 사람이 가져오기로 병합하면 전체 결과를 볼 수 있습니다.</p>`;
+  shareCard.innerHTML = `<h3 style="margin-top:0">📤 파일로 공유 (보조 수단)</h3>
+    <p class="hint">서버 없이 JSON 파일로 주고받아 병합할 수도 있습니다.</p>`;
   const row1 = document.createElement("div");
   row1.className = "settings-row";
   const expBtn = document.createElement("button");
   expBtn.className = "btn";
-  expBtn.textContent = "📤 이 일정 JSON 내보내기";
+  expBtn.textContent = "📤 JSON 내보내기";
   expBtn.addEventListener("click", () => exportSchedule(sc));
   const impBtn = document.createElement("button");
   impBtn.className = "btn";
@@ -550,11 +831,13 @@ function renderShareTab(sc) {
   shareCard.appendChild(row1);
   app.appendChild(shareCard);
 
+  // 설정
   const setCard = document.createElement("div");
   setCard.className = "card";
   setCard.innerHTML = `<h3 style="margin-top:0">⚙️ 설정</h3>
-    <p class="hint">현재 조사 기간: <strong>${monthRangeLabel(sc.months)}</strong></p>`;
+    <p class="hint">현재 조사 기간: <strong>${monthRangeLabel(sc.months)}</strong> (${sc.months.map(ymLabel).join(", ")})</p>`;
 
+  // 월 추가
   const rowMonth = document.createElement("div");
   rowMonth.className = "settings-row";
   const addBtn = document.createElement("button");
@@ -564,7 +847,9 @@ function renderShareTab(sc) {
   addBtn.addEventListener("click", () => {
     sc.months.push(nm);
     sc.months.sort();
+    sc.monthOps[nm] = { op: "add", ts: Date.now() };
     saveStore();
+    queueSync(sc);
     render();
   });
   rowMonth.appendChild(addBtn);
@@ -574,6 +859,65 @@ function renderShareTab(sc) {
   rowMonth.appendChild(monthHint);
   setCard.appendChild(rowMonth);
 
+  // 조회 중단(월 줄이기): 범위 선택
+  setCard.insertAdjacentHTML("beforeend", `<hr class="divider">
+    <h4 style="margin:0 0 4px">🚫 일정 조회 중단하기 (기간 줄이기)</h4>
+    <p class="hint" style="margin-top:0">실수로 추가한 달을 없앨 수 있습니다. 여러 달을 한 번에 중단할 수 있으며, <strong>해당 기간에 기입된 체크 데이터는 모두 삭제되고 복구할 수 없습니다.</strong></p>`);
+  const rowDel = document.createElement("div");
+  rowDel.className = "settings-row";
+  const fromSel = document.createElement("select");
+  const toSel = document.createElement("select");
+  for (const s of [fromSel, toSel]) {
+    s.className = "month-select";
+    sc.months.forEach(ym => {
+      const o = document.createElement("option");
+      o.value = ym;
+      o.textContent = ymLabel(ym);
+      s.appendChild(o);
+    });
+  }
+  toSel.value = sc.months[sc.months.length - 1];
+  const delLabel1 = document.createElement("span");
+  delLabel1.textContent = "부터";
+  const delLabel2 = document.createElement("span");
+  delLabel2.textContent = "까지";
+  const delBtn = document.createElement("button");
+  delBtn.className = "btn btn-danger btn-small";
+  delBtn.textContent = "조회 중단하기";
+  delBtn.addEventListener("click", () => {
+    const from = fromSel.value, to = toSel.value;
+    if (from > to) { alert("시작 월이 끝 월보다 늦습니다. 다시 선택해 주세요."); return; }
+    const target = sc.months.filter(ym => ym >= from && ym <= to);
+    if (target.length >= sc.months.length) {
+      alert("조사 기간은 최소 한 달은 남아 있어야 합니다.");
+      return;
+    }
+    const label = from === to ? ymLabel(from) : `${ymLabel(from)}부터 ${ymLabel(to)}까지`;
+    const ans = prompt(
+      `⚠️ 지우면 데이터 복구가 불가능합니다.\n${label} 조사받기를 지우시겠습니까?\n\n(해당 기간에 기입된 모든 체크가 삭제됩니다)\n계속하려면 아래에 "지우겠습니다"를 정확히 입력하세요.`
+    );
+    if (ans !== "지우겠습니다") {
+      if (ans !== null) alert("입력이 일치하지 않아 취소되었습니다.");
+      return;
+    }
+    const now = Date.now();
+    for (const ym of target) sc.monthOps[ym] = { op: "del", ts: now };
+    sc.months = sc.months.filter(ym => !target.includes(ym));
+    purgeRemovedMonths(sc);
+    saveStore();
+    queueSync(sc);
+    alert(`${label} 조사받기를 중단하고 해당 기간의 데이터를 모두 삭제했습니다.`);
+    render();
+  });
+  rowDel.appendChild(fromSel);
+  rowDel.appendChild(delLabel1);
+  rowDel.appendChild(toSel);
+  rowDel.appendChild(delLabel2);
+  rowDel.appendChild(delBtn);
+  setCard.appendChild(rowDel);
+
+  // 기준 인원
+  setCard.insertAdjacentHTML("beforeend", `<hr class="divider">`);
   const rowTh = document.createElement("div");
   rowTh.className = "settings-row";
   const thLabel = document.createElement("label");
@@ -589,7 +933,9 @@ function renderShareTab(sc) {
   thBtn.addEventListener("click", () => {
     const v = Math.max(1, Math.min(sc.participants.length, +thInput.value || sc.threshold));
     sc.threshold = v;
+    sc.settingsTs = Date.now();
     saveStore();
+    queueSync(sc);
     alert(`기준 인원이 ${v}명으로 변경되었습니다.`);
     render();
   });
@@ -605,10 +951,10 @@ function renderShareTab(sc) {
     dz.className = "card danger-zone";
     dz.innerHTML = `<h3>🗑️ 일정 삭제</h3>
       <p class="hint">이 일정은 내가 만든 일정입니다. 삭제하면 되돌릴 수 없습니다.</p>`;
-    const delBtn = document.createElement("button");
-    delBtn.className = "btn btn-danger";
-    delBtn.textContent = "이 일정 삭제하기";
-    delBtn.addEventListener("click", () => {
+    const delBtn2 = document.createElement("button");
+    delBtn2.className = "btn btn-danger";
+    delBtn2.textContent = "이 일정 삭제하기";
+    delBtn2.addEventListener("click", () => {
       if (confirm(`"${sc.title}" 일정을 정말 삭제할까요? 되돌릴 수 없습니다.`) &&
           confirm("모든 참가자의 체크 기록도 함께 삭제됩니다. 계속할까요?")) {
         store.schedules = store.schedules.filter(s => s.id !== sc.id);
@@ -617,7 +963,7 @@ function renderShareTab(sc) {
         render();
       }
     });
-    dz.appendChild(delBtn);
+    dz.appendChild(delBtn2);
     app.appendChild(dz);
   } else {
     const p = document.createElement("p");
@@ -627,7 +973,7 @@ function renderShareTab(sc) {
   }
 }
 
-// ===== 내보내기 / 가져오기 =====
+// ===== 내보내기 / 가져오기 (파일) =====
 function exportSchedule(sc) {
   const payload = { type: "moim-schedule", version: 2, schedule: sc };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -662,17 +1008,10 @@ fileImport.addEventListener("change", () => {
 
       const existing = getSchedule(inc.id) || (importTargetId ? getSchedule(importTargetId) : null);
       if (existing) {
-        // 병합: 참가자 이름 기준으로 체크 날짜 합치기, 조사 기간(월)도 합치기
-        for (const ym of inc.months) {
-          if (!existing.months.includes(ym)) existing.months.push(ym);
-        }
-        existing.months.sort();
-        for (const name of Object.keys(inc.availability)) {
-          if (!existing.participants.includes(name)) continue;
-          const dst = existing.availability[name] || (existing.availability[name] = {});
-          Object.assign(dst, inc.availability[name]);
-        }
+        mergeSchedule(existing, inc);
+        if (!existing.syncId && inc.syncId) existing.syncId = inc.syncId;
         alert(`"${existing.title}" 일정에 데이터를 병합했습니다.`);
+        queueSync(existing);
         state = { view: "detail", scheduleId: existing.id, tab: "result", pIdx: 0 };
       } else {
         if (!inc.id) inc.id = uid();
